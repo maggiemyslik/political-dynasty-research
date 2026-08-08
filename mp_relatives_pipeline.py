@@ -22,7 +22,8 @@ Steps:
 
 Usage:
     pip install pandas numpy pyreadstat
-    python mp_relatives_pipeline.py --dta MPdata1_2_basic_bio.dta --outdir .
+    python mp_relatives_pipeline.py --dta MPdata1_2_basic_bio.dta --outdir 
+    
 """
 from __future__ import annotations
 import argparse
