@@ -1,488 +1,180 @@
+#!/usr/bin/env python3
 """
-====================
+Resolve the verbatim names in divisions_raw.csv to member IDs.
 
-Parsing and name-resolution layer for UK House of Commons division lists,
-5th series Hansard (1909- ), targeting the 1910-1987 coverage gap.
+    python hansard_resolve.py --roster data/role_call_votes/member_spells.csv
 
-Two stages, deliberately kept separate:
+Reads  data/role_call_votes/divisions_raw.csv
+Writes data/role_call_votes/divisions_resolved.csv
+       data/role_call_votes/unresolved.csv   (adjudication queue, top 3 candidates)
 
-  Stage 1  parse_division()      raw division text  ->  structured Division
-  Stage 2  MemberRoster.match()  parsed name + date ->  member_id
-
-Stage 1 is mechanical and should be near-lossless. Stage 2 is the hard part
-and is where you want to keep every scrap of evidence the printed list gives
-you (initials, constituency, honorific, rank) rather than collapsing to a
-surname early.
-
-Design note on ordering
------------------------
-Historic Hansard prints division lists in two or three newspaper-style
-columns. Naive text extraction interleaves them wrongly. This does not
-matter: a division list is a *set*, not a sequence. Never rely on order.
-The one thing you must not lose is which side (Aye/No) a name sat under,
-and the tellers, who are votes but are printed outside the lists.
+The roster must be spell-level, one row per member x seat x date range:
+    member_id,surname,forenames,constituency,start,end,party
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import re
 import unicodedata
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
 from difflib import SequenceMatcher
-from typing import Iterable, Iterator, Optional, Sequence
+from pathlib import Path
+from typing import Iterable, Optional
 
+DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "role_call_votes"
+RAW_NAME = "divisions_raw.csv"
+RESOLVED_NAME = "divisions_resolved.csv"
+REVIEW_NAME = "unresolved.csv"
 
-# ---------------------------------------------------------------------------
-# 1. Vocabularies
-# ---------------------------------------------------------------------------
+THRESHOLD = 0.60
+AMBIGUITY_GAP = 0.10
 
-# Stripped before surname parsing, but retained on the record: honorifics are
-# a weak identity signal (Rt Hon => held/holds Cabinet office; Sir => baronet
-# or knight) and a strong OCR-error signal.
-HONORIFICS = {
-    "mr", "mrs", "miss", "ms", "dr", "sir", "dame", "lord", "lady",
-    "viscount", "viscountess", "earl", "marquess", "hon", "rt hon",
-    "right hon", "the hon",
+# --------------------------------------------------------------------------
+# Vocabularies
+# --------------------------------------------------------------------------
+
+HONORIFIC = re.compile(
+    r"^\s*((?:Rt\.?\s*Hon|Right\s+Hon|The\s+Hon|Hon|Mr|Mrs|Miss|Ms|Dr|Sir|Dame|"
+    r"Lady|Lord|Viscountess|Viscount|Earl|Marquess)\.?)(?=\s|$)\s*", re.I
+)
+RANK = re.compile(
+    r"^\s*((?:Lieutenant|Lieut|Lt)\.?[-\s]*(?:Colonel|Col|Commander|Comdr)\.?|"
+    r"Brigadier[-\s]*General|Brigadier|Brig\.?[-\s]*Gen\.?|Brig\.?|"
+    r"Squadron\s+Leader|Sqn\.?[-\s]*Ldr\.?|Wing\s+Commander|Wing\s+Comdr\.?|"
+    r"Flight\s+Lieutenant|Fl(?:igh)?t\.?\s*Lieut\.?|"
+    r"Rear[-\s]*Admiral|Vice[-\s]*Admiral|Colonel|Col\.?|Captain|Capt\.?|"
+    r"Major[-\s]*General|Major|Maj\.?|Admiral|Adm\.?|Commander|Comdr\.?|"
+    r"General|Gen\.?|Professor|Prof\.?|Alderman)(?=\s|$)\s*", re.I
+)
+PARTICLES = {"de", "du", "van", "von", "le", "la", "st", "ap", "der", "den", "ter"}
+# Tokens that distinguish seats sharing a base name (Newcastle E / N / W).
+QUALIFIERS = {
+    "north", "south", "east", "west", "central", "centre", "mid", "middle",
+    "upper", "lower", "ne", "nw", "se", "sw", "north-east", "north-west",
+    "south-east", "south-west", "city", "county", "borough", "burghs",
+    "university", "universities", "first", "second", "third", "division",
 }
-
-# Military and professional ranks are extremely common 1918-1955. Note the
-# spelling drift: "Lieut.-Colonel", "Lieut.-Col.", "Lt.-Col.", "Lieutenant-
-# Colonel" are the same rank across four decades of typesetting.
-RANKS = {
-    "col", "colonel", "lt col", "lieut col", "lieutenant colonel",
-    "lt comdr", "lieut commander", "commander", "capt", "captain",
-    "maj", "major", "brig", "brigadier", "brigadier general",
-    "gen", "general", "adm", "admiral", "rear admiral", "vice admiral",
-    "sqn ldr", "squadron leader", "wing comdr", "wing commander",
-    "flt lieut", "flight lieutenant", "sir", "prof", "professor",
-    "alderman", "earl",
-}
-
-# Surname particles that must stay attached to the surname.
-PARTICLES = {
-    "de", "de la", "du", "van", "van der", "von", "le", "la",
-    "o", "mac", "mc", "st", "ap",
-}
-
-# OCR confusions seen in scanned 5th-series division lists. Applied only to
-# the normalised matching key, never to the stored surface form.
-OCR_SUBSTITUTIONS = [
+OCR_FIXES = [
     (r"\brn\b", "m"),
-    (r"(?<=[a-z])1(?=[a-z])", "l"),   # Wi1son -> Wilson
-    (r"(?<=[a-z])0(?=[a-z])", "o"),   # J0hnson -> Johnson
+    (r"(?<=[a-z])1(?=[a-z])", "l"),
+    (r"(?<=[a-z])0(?=[a-z])", "o"),
     (r"(?<=[a-z])5(?=[a-z])", "s"),
-    (r"\bl\.-col", "lt.-col"),
 ]
+CONNECTIVES = {"upon", "on", "under", "in", "and", "the"}
+PUNCT = re.compile(r"[.,;:]+")
+PARENS = re.compile(r"\(([^)]*)\)")
 
 
-# ---------------------------------------------------------------------------
-# 2. Records
-# ---------------------------------------------------------------------------
+def key(text: str) -> str:
+    text = "".join(
+        c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)
+    ).lower()
+    for pattern, repl in OCR_FIXES:
+        text = re.sub(pattern, repl, text)
+    text = re.sub(r"^m['\u2019c]\s*", "mac", text)
+    text = re.sub(r"^mac\s+", "mac", text)
+    return re.sub(r"[^a-z]", "", text)
+
+
+# --------------------------------------------------------------------------
+# Name parsing
+# --------------------------------------------------------------------------
 
 @dataclass
 class ParsedName:
-    """One line of a printed division list, decomposed."""
     raw: str
-    surname: str                     # surface form, e.g. "Lloyd-Greame"
-    surname_key: str                 # matching key, e.g. "lloydgreame"
-    initials: str = ""               # "A.V." -> "AV"
-    forenames: str = ""              # spelled-out forenames, if printed
-    honorific: str = ""              # "Rt. Hon.", "Sir", "Mr."
-    rank: str = ""                   # "Lieut.-Colonel"
-    constituency: str = ""           # from trailing parentheses
-    is_teller: bool = False
-    parse_flags: list[str] = field(default_factory=list)
-
-    @property
-    def first_initial(self) -> str:
-        if self.initials:
-            return self.initials[0]
-        if self.forenames:
-            return self.forenames[0].upper()
-        return ""
+    surname: str
+    surname_key: str
+    initials: str = ""
+    forenames: str = ""
+    honorific: str = ""
+    rank: str = ""
+    constituency: str = ""
+    flags: list[str] = field(default_factory=list)
 
 
-@dataclass
-class Vote:
-    member_id: Optional[str]         # filled by stage 2
-    side: str                        # "aye" | "no"
-    name: ParsedName
-    match_confidence: float = 0.0
-    match_method: str = "unmatched"
-    match_candidates: int = 0
-
-
-@dataclass
-class Division:
-    # --- identification -----------------------------------------------
-    division_number: Optional[int] = None     # resets each session
-    session: str = ""                         # "1935-36"
-    date: Optional[date] = None
-    time: str = ""                            # "10.14 p.m." from the header
-    # --- source location ----------------------------------------------
-    series: str = "5"                         # 5th series from 1909
-    volume: Optional[int] = None
-    column_start: Optional[int] = None
-    source_url: str = ""
-    # --- substance ----------------------------------------------------
-    debate_title: str = ""                    # enclosing debate heading
-    question_text: str = ""                   # the motion actually put
-    # --- result -------------------------------------------------------
-    ayes_declared: Optional[int] = None       # as printed
-    noes_declared: Optional[int] = None
-    votes: list[Vote] = field(default_factory=list)
-    parse_flags: list[str] = field(default_factory=list)
-
-    @property
-    def ayes_counted(self) -> int:
-        return sum(1 for v in self.votes if v.side == "aye")
-
-    @property
-    def noes_counted(self) -> int:
-        return sum(1 for v in self.votes if v.side == "no")
-
-    def reconcile(self) -> list[str]:
-        """
-        The single most valuable validation you have: Hansard prints the
-        declared totals separately from the name lists, so counted-vs-declared
-        is a free integrity check on every division. Discrepancies are almost
-        always dropped OCR lines or missing tellers, not clerical error in
-        the original.
-        """
-        problems = []
-        if self.ayes_declared is not None and self.ayes_counted != self.ayes_declared:
-            problems.append(
-                f"aye mismatch: counted {self.ayes_counted} vs declared {self.ayes_declared}"
-            )
-        if self.noes_declared is not None and self.noes_counted != self.noes_declared:
-            problems.append(
-                f"no mismatch: counted {self.noes_counted} vs declared {self.noes_declared}"
-            )
-        return problems
-
-
-# ---------------------------------------------------------------------------
-# 3. Name parsing
-# ---------------------------------------------------------------------------
-
-_PUNCT_RE = re.compile(r"[.,;:]+")
-_WS_RE = re.compile(r"\s+")
-_PAREN_RE = re.compile(r"\(([^)]*)\)")
-_INITIAL_TOKEN_RE = re.compile(r"^[A-Z]\.?$")
-
-
-def _strip_accents(s: str) -> str:
-    return "".join(
-        c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c)
-    )
-
-
-def normalise_key(s: str) -> str:
-    """Aggressive normalisation for the blocking/matching key only."""
-    s = _strip_accents(s).lower()
-    for pat, rep in OCR_SUBSTITUTIONS:
-        s = re.sub(pat, rep, s)
-    # Mac/Mc/M' collapse: MacDonald, McDonald, M'Donald all key to macdonald
-    s = re.sub(r"^m['’c]\s*", "mac", s)
-    s = re.sub(r"^mac\s+", "mac", s)
-    s = re.sub(r"[^a-z]", "", s)
-    return s
-
-
-def _extract_honorific(text: str) -> tuple[str, str]:
-    """Pull a leading honorific off a forename blob."""
-    m = re.match(
-        r"^\s*((?:Rt\.?\s*Hon\.?|Right\s+Hon\.?|The\s+Hon\.?|Hon\.?|Mr\.?|Mrs\.?|"
-        r"Miss|Ms\.?|Dr\.?|Sir|Dame|Lady|Lord|Viscountess|Viscount)\s*)",
-        text,
-        flags=re.I,
-    )
-    if not m:
-        return "", text
-    return m.group(1).strip(), text[m.end():]
-
-
-def _extract_rank(text: str) -> tuple[str, str]:
-    # NOTE: longest alternative first in every family. Otherwise "Capt\.?"
-    # matches the first four letters of "Captain" and leaves "ain" behind,
-    # which then gets parsed as a forename and blocks the match.
-    m = re.match(
-        r"^\s*((?:Lieutenant|Lieut\.?|Lt\.?)[-\s]*(?:Colonel|Col\.?|Commander|Comdr\.?)|"
-        r"Brigadier[-\s]*(?:General)?|Brig\.?[-\s]*(?:General|Gen\.?)?|"
-        r"Squadron\s+Leader|Sqn\.?[-\s]*Ldr\.?|"
-        r"Wing\s+Commander|Wing\s+Comdr\.?|"
-        r"Flight\s+Lieutenant|Flight\s+Lieut\.?|Flt\.?\s*Lieut\.?|"
-        r"Colonel|Col\.?|Captain|Capt\.?|Major|Maj\.?|"
-        r"Admiral|Adm\.?|Commander|Comdr\.?|"
-        r"General|Gen\.?|Professor|Prof\.?|Alderman)"
-        r"\.?(?=\s|$)\s*",
-        text,
-        flags=re.I,
-    )
-    if not m:
-        return "", text
-    return m.group(1).strip(), text[m.end():]
-
-
-def parse_member_name(raw: str, is_teller: bool = False) -> Optional[ParsedName]:
-    """
-    Parse one printed entry.
-
-    The dominant 5th-series format is:
-
-        Surname, Initials
-        Surname, Rt. Hon. Initials
-        Surname, Rank Initials (Constituency)
-        Surname, Forename (Constituency)
-
-    i.e. surname first, comma, then everything else. This holds for the
-    overwhelming majority of lines 1910-1987, but see parse_flags for the
-    cases where it does not:
-
-      * no comma at all              "Bevan"            (bare surname)
-      * title-as-surname             "Cecil, Lord H."   (honorific after comma)
-      * double-barrelled surnames    "Acland-Troyte, Lt.-Col. G. J."
-      * particles                    "de Chair, S. S." / "Mander, G. le M."
-      * constituency disambiguators  "Davies, R. J. (Westhoughton)"
-    """
-    raw = raw.strip()
-    if not raw:
-        return None
-
-    text = _WS_RE.sub(" ", raw)
-    flags: list[str] = []
-
-    # Constituency in trailing parentheses. Sometimes doubled:
-    # "Griffiths, T. (Monmouth, Pontypool)"
-    constituency = ""
-    parens = _PAREN_RE.findall(text)
-    if parens:
-        constituency = parens[-1].strip()
-        text = _PAREN_RE.sub("", text).strip()
-
-    # Split on the FIRST comma only. Later commas belong to the constituency
-    # (already removed) or are OCR noise.
-    if "," in text:
-        surname_part, rest = text.split(",", 1)
-    else:
-        surname_part, rest = text, ""
-        flags.append("no_comma")
-
-    surname = surname_part.strip().rstrip(".")
-    if not surname:
-        return None
-
-    honorific, rest = _extract_honorific(rest)
-    rank, rest = _extract_rank(rest)
-    # Honorific can follow the rank: "Lt.-Col. Rt. Hon. J. T. C."
-    if not honorific:
-        honorific, rest = _extract_honorific(rest)
-
-    # Remaining tokens are initials and/or spelled-out forenames.
-    initials_chars: list[str] = []
-    forenames: list[str] = []
-    for tok in rest.replace(".", ". ").split():
-        clean = _PUNCT_RE.sub("", tok)
-        if not clean:
+def _strip_titles(text: str) -> tuple[str, str, str]:
+    """Peel honorifics and ranks in any order until neither matches."""
+    honorifics, ranks = [], []
+    while True:
+        if m := HONORIFIC.match(text):
+            honorifics.append(m[1].strip())
+            text = text[m.end():]
             continue
-        if len(clean) == 1 and clean.isalpha():
-            initials_chars.append(clean.upper())
-        elif clean.lower() in PARTICLES or clean in {"La", "Le", "De", "Du", "Van"}:
-            # "McEntee, V. La T." - particle inside the forename blob
-            flags.append("forename_particle")
-        elif clean.isalpha():
-            forenames.append(clean)
-        else:
-            flags.append(f"odd_token:{clean}")
+        if m := RANK.match(text):
+            ranks.append(m[1].strip())
+            text = text[m.end():]
+            continue
+        break
+    return " ".join(honorifics), " ".join(ranks), text
 
-    if not initials_chars and not forenames:
+
+def parse_name(raw: str, teller: bool = False) -> Optional[ParsedName]:
+    """List entries are surname-first; tellers are printed forename-first."""
+    text = re.sub(r"\s+", " ", raw).strip()
+    if not text:
+        return None
+
+    constituency = ""
+    if found := PARENS.findall(text):
+        constituency = found[-1].strip()
+        text = PARENS.sub("", text).strip()
+
+    flags: list[str] = []
+    if teller:
+        honorific, rank, rest = _strip_titles(text)
+        tokens = [PUNCT.sub("", t) for t in rest.split()]
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            return None
+        surname = tokens[-1]
+        head = tokens[:-1]
+        flags.append("teller_forename_first")
+    else:
+        if "," in text:
+            surname_part, rest = text.split(",", 1)
+        else:
+            surname_part, rest = text, ""
+            flags.append("no_comma")
+        honorific, rank, surname_part = _strip_titles(surname_part)
+        surname = surname_part.strip().rstrip(".")
+        extra_hon, extra_rank, rest = _strip_titles(rest)
+        honorific = " ".join(x for x in (honorific, extra_hon) if x)
+        rank = " ".join(x for x in (rank, extra_rank) if x)
+        head = [PUNCT.sub("", t) for t in rest.split()]
+        head = [t for t in head if t]
+
+    if not surname or key(surname) in {key(w) for w in re.split(r"[\s.-]+", rank) if w}:
+        return None
+
+    initials, forenames = [], []
+    for token in head:
+        if len(token) == 1 and token.isalpha():
+            initials.append(token.upper())
+        elif token.lower() in PARTICLES:
+            flags.append("forename_particle")
+        elif token.isalpha():
+            forenames.append(token)
+    if not initials and not forenames:
         flags.append("no_forename")
 
     return ParsedName(
-        raw=raw,
-        surname=surname,
-        surname_key=normalise_key(surname),
-        initials="".join(initials_chars),
-        forenames=" ".join(forenames),
-        honorific=honorific,
-        rank=rank,
-        constituency=constituency,
-        is_teller=is_teller,
-        parse_flags=flags,
+        raw=raw, surname=surname, surname_key=key(surname),
+        initials="".join(initials), forenames=" ".join(forenames),
+        honorific=honorific, rank=rank, constituency=constituency, flags=flags,
     )
 
 
-# ---------------------------------------------------------------------------
-# 4. Division parsing
-# ---------------------------------------------------------------------------
-
-_DIV_HEADER_RE = re.compile(
-    r"Division\s+No\.?\s*(\d+)", re.I
-)
-_TIME_RE = re.compile(r"\[?\s*(\d{1,2}[.:]\d{2}\s*[ap]\.?\s*m\.?)", re.I)
-_TOTALS_RE = re.compile(
-    r"The\s+House\s+divided:?\s*Ayes,?\s*(\d+)\s*;?\s*Noes,?\s*(\d+)", re.I
-)
-_AYES_HEAD_RE = re.compile(r"^\s*AYES\.?\s*$", re.I | re.M)
-_NOES_HEAD_RE = re.compile(r"^\s*NOES\.?\s*$", re.I | re.M)
-_TELLERS_RE = re.compile(
-    r"TELLERS\s+FOR\s+THE\s+(AYES|NOES)[.:\s—-]*(.*?)(?=TELLERS|^\s*(?:AYES|NOES)\.?\s*$|\Z)",
-    re.I | re.S | re.M,
-)
-_QUESTION_RE = re.compile(
-    r"(Question\s+(?:again\s+)?put,?\s*[\"“][^\"”]*[\"”]\.?|Question\s+put\.)", re.I | re.S
-)
-
-
-def _split_cells(block: str) -> Iterator[str]:
-    """
-    Yield candidate name entries from a list block.
-
-    Column-aware text extraction from Historic Hansard HTML gives one name per
-    <td>; plain-text extraction gives 2-3 names per physical line separated by
-    runs of whitespace. Handle both by splitting on newlines AND on runs of
-    3+ spaces.
-    """
-    for line in block.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        for cell in re.split(r"\s{3,}|\t+", line):
-            cell = cell.strip()
-            if cell:
-                yield cell
-
-
-def _looks_like_name(cell: str) -> bool:
-    if len(cell) < 3:
-        return False
-    if re.match(r"^(tellers|ayes|noes|division|the house)", cell, re.I):
-        return False
-    if not re.search(r"[A-Za-z]{2}", cell):
-        return False
-    return True
-
-
-def parse_tellers(text: str) -> dict[str, list[ParsedName]]:
-    """
-    Tellers are votes. They are printed as 'Mr. X and Mr. Y', forename-first,
-    which is the reverse of the list format, so they need their own parser.
-    Omitting them is the most common single cause of a counted-vs-declared
-    off-by-two.
-    """
-    out: dict[str, list[ParsedName]] = {"aye": [], "no": []}
-    for side_word, blob in _TELLERS_RE.findall(text):
-        side = "aye" if side_word.lower().startswith("aye") else "no"
-        blob = _PAREN_RE.sub("", blob)
-        for chunk in re.split(r"\band\b|,", blob, flags=re.I):
-            chunk = chunk.strip(" .;—-\n")
-            if not _looks_like_name(chunk):
-                continue
-            hon, rest = _extract_honorific(chunk)
-            rank, rest = _extract_rank(rest)
-            toks = [_PUNCT_RE.sub("", t) for t in rest.split() if _PUNCT_RE.sub("", t)]
-            if not toks:
-                continue
-            surname = toks[-1]
-            inits = "".join(t.upper() for t in toks[:-1] if len(t) == 1)
-            fores = " ".join(t for t in toks[:-1] if len(t) > 1)
-            out[side].append(
-                ParsedName(
-                    raw=chunk,
-                    surname=surname,
-                    surname_key=normalise_key(surname),
-                    initials=inits,
-                    forenames=fores,
-                    honorific=hon,
-                    rank=rank,
-                    is_teller=True,
-                    parse_flags=["teller_forename_first"],
-                )
-            )
-    return out
-
-
-def parse_division(text: str, **meta) -> Division:
-    """
-    Parse one division from Hansard text. `meta` overrides or supplies fields
-    the text does not carry (session, volume, column_start, source_url,
-    debate_title, date).
-    """
-    div = Division(**{k: v for k, v in meta.items() if k in Division.__annotations__})
-
-    if m := _DIV_HEADER_RE.search(text):
-        div.division_number = int(m.group(1))
-    if not div.time:
-        if m := _TIME_RE.search(text[:400]):
-            div.time = m.group(1).strip()
-    if m := _TOTALS_RE.search(text):
-        div.ayes_declared, div.noes_declared = int(m.group(1)), int(m.group(2))
-    if not div.question_text:
-        if m := _QUESTION_RE.search(text):
-            div.question_text = _WS_RE.sub(" ", m.group(1)).strip()
-
-    # Locate the AYES / NOES blocks.
-    aye_m = _AYES_HEAD_RE.search(text) or _DIV_HEADER_RE.search(text)
-    no_m = _NOES_HEAD_RE.search(text)
-    if aye_m is None or no_m is None:
-        div.parse_flags.append("missing_side_heading")
-        return div
-
-    aye_block = text[aye_m.end(): no_m.start()]
-    no_block = text[no_m.end():]
-
-    tellers = parse_tellers(text)
-
-    for side, block in (("aye", aye_block), ("no", no_block)):
-        # Drop the teller lines from the name block so they are not parsed twice.
-        block = _TELLERS_RE.sub("", block)
-        for cell in _split_cells(block):
-            if not _looks_like_name(cell):
-                continue
-            pn = parse_member_name(cell)
-            if pn:
-                div.votes.append(Vote(member_id=None, side=side, name=pn))
-        for pn in tellers[side]:
-            div.votes.append(Vote(member_id=None, side=side, name=pn))
-
-    div.parse_flags.extend(div.reconcile())
-    return div
-
-
-# ---------------------------------------------------------------------------
-# 5. Roster matching
-# ---------------------------------------------------------------------------
-
-def _constituency_agrees(printed: str, roster: str, ratio: float = 0.85) -> bool:
-    """
-    Constituency strings need fuzzy comparison for three separate reasons:
-
-      * spelling drift over the period   "Merthyr Tydvil" / "Merthyr Tydfil"
-      * county-then-seat qualifiers      "(Monmouth, Pontypool)" -> Pontypool
-      * ordering and connectives         "Ross and Cromarty" / "Ross & Cromarty"
-
-    Token overlap catches the second, sequence ratio catches the first.
-    """
-    p_tokens = {normalise_key(t) for t in re.split(r"[,\s/&-]+", printed) if len(t) > 2}
-    r_tokens = {normalise_key(t) for t in re.split(r"[,\s/&-]+", roster) if len(t) > 2}
-    p_tokens.discard("and")
-    r_tokens.discard("and")
-    if p_tokens & r_tokens:
-        return True
-    pk, rk = normalise_key(printed), normalise_key(roster)
-    if pk and rk and (pk in rk or rk in pk):
-        return True
-    for a in p_tokens:
-        for b in r_tokens:
-            if SequenceMatcher(None, a, b).ratio() >= ratio:
-                return True
-    return False
-
+# --------------------------------------------------------------------------
+# Roster
+# --------------------------------------------------------------------------
 
 @dataclass
-class RosterMember:
+class Spell:
     member_id: str
     surname: str
     forenames: str
@@ -493,300 +185,259 @@ class RosterMember:
 
     @property
     def surname_key(self) -> str:
-        return normalise_key(self.surname)
+        return key(self.surname)
 
     @property
     def initials(self) -> str:
         return "".join(w[0].upper() for w in self.forenames.split() if w)
 
-    def serving_on(self, d: Optional[date]) -> bool:
-        if d is None:
+    def covers(self, day: Optional[date]) -> bool:
+        if day is None:
             return True
-        if self.start and d < self.start:
-            return False
-        if self.end and d > self.end:
-            return False
-        return True
+        return not ((self.start and day < self.start) or (self.end and day > self.end))
 
 
-class MemberRoster:
+def _seat_tokens(name: str) -> tuple[set[str], set[str]]:
+    tokens = [key(t) for t in re.split(r"[,\s/&-]+", name) if len(t) > 1]
+    base = {t for t in tokens if t and t not in {key(q) for q in QUALIFIERS} and t != "and"}
+    quals = {t for t in tokens if t in {key(q) for q in QUALIFIERS}}
+    return base, quals
+
+
+def seats_agree(printed: str, roster: str) -> bool:
     """
-    Blocking index over a roster of MP service spells.
-
-    Build this from Rush + Wikidata rather than from the division lists
-    themselves. The unit is the *spell* (member x seat x date range), not the
-    person, because constituency changes are the main disambiguator available.
+    Names must share a place token, neither side may name a further place the
+    other does not (Kingston upon Thames vs Kingston upon Hull), and directional
+    qualifiers must not conflict (Newcastle East vs Newcastle North). A county
+    prefix on one side only is allowed (Monmouth, Pontypool vs Pontypool).
     """
+    p_base, p_qual = _seat_tokens(printed)
+    r_base, r_qual = _seat_tokens(roster)
+    left, right = p_base - CONNECTIVES, r_base - CONNECTIVES
+    if not left or not right:
+        return False
 
-    def __init__(self, members: Iterable[RosterMember]):
-        self.members = list(members)
-        self._by_surname: dict[str, list[RosterMember]] = {}
-        for m in self.members:
-            self._by_surname.setdefault(m.surname_key, []).append(m)
+    paired_left, paired_right = set(), set()
+    for a in left:
+        for b in right:
+            if a == b or SequenceMatcher(None, a, b).ratio() >= 0.80:
+                paired_left.add(a)
+                paired_right.add(b)
+    if not paired_left:
+        return False
+    if (left - paired_left) and (right - paired_right):
+        return False
+    if p_qual and r_qual and not (p_qual & r_qual):
+        return False
+    return True
+
+
+def score(name: ParsedName, spell: Spell) -> tuple[float, str]:
+    value, why = 0.55, "surname"
+    if name.initials and spell.initials:
+        if name.initials == spell.initials:
+            value, why = 0.97, "initials"
+        elif spell.initials.startswith(name.initials):
+            value, why = 0.88, "initial_prefix"
+        elif name.initials[0] == spell.initials[0]:
+            value, why = 0.72, "first_initial"
+        else:
+            return 0.05, "initials_conflict"
+    elif name.forenames:
+        first = name.forenames.split()[0].lower()
+        theirs = (spell.forenames.split() or [""])[0].lower()
+        if first == theirs:
+            value, why = 0.95, "forename"
+        elif theirs.startswith(first) or first.startswith(theirs):
+            value, why = 0.80, "forename_prefix"
+        else:
+            return 0.05, "forename_conflict"
+    if name.constituency and spell.constituency:
+        if seats_agree(name.constituency, spell.constituency):
+            value, why = min(0.99, value + 0.15), why + "+seat"
+        else:
+            value, why = max(0.10, value - 0.35), why + "+seat_conflict"
+    return value, why
+
+
+class Roster:
+    def __init__(self, spells: Iterable[Spell]):
+        self.by_surname: dict[str, list[Spell]] = defaultdict(list)
+        self.by_id: dict[str, Spell] = {}
+        for spell in spells:
+            self.by_surname[spell.surname_key].append(spell)
+            self.by_id[spell.member_id] = spell
 
     @classmethod
-    def from_csv(cls, path: str) -> "MemberRoster":
-        """Expects: member_id,surname,forenames,constituency,start,end,party"""
-        def _d(s: str) -> Optional[date]:
-            s = (s or "").strip()
-            return date.fromisoformat(s) if s else None
+    def from_csv(cls, path: Path) -> "Roster":
+        def day(value: str) -> Optional[date]:
+            value = (value or "").strip()
+            return date.fromisoformat(value) if value else None
 
-        with open(path, newline="", encoding="utf-8") as fh:
-            rows = list(csv.DictReader(fh))
-        return cls(
-            RosterMember(
-                member_id=r["member_id"],
-                surname=r["surname"],
-                forenames=r.get("forenames", ""),
-                constituency=r.get("constituency", ""),
-                start=_d(r.get("start", "")),
-                end=_d(r.get("end", "")),
-                party=r.get("party", ""),
+        with path.open(newline="", encoding="utf-8") as fh:
+            return cls(
+                Spell(
+                    member_id=row["member_id"], surname=row["surname"],
+                    forenames=row.get("forenames", ""),
+                    constituency=row.get("constituency", ""),
+                    start=day(row.get("start", "")), end=day(row.get("end", "")),
+                    party=row.get("party", ""),
+                )
+                for row in csv.DictReader(fh)
             )
-            for r in rows
+
+    def candidates(self, name: ParsedName, day: Optional[date]
+                   ) -> list[tuple[float, str, Spell]]:
+        pool = [s for s in self.by_surname.get(name.surname_key, []) if s.covers(day)]
+        scored = []
+        for spell in pool:
+            value, why = score(name, spell)
+            if len(pool) == 1 and value >= 0.50:
+                value, why = max(value, 0.85), why + "+unique_surname"
+            scored.append((value, why, spell))
+        return sorted(scored, key=lambda t: -t[0])
+
+
+# --------------------------------------------------------------------------
+# Resolution
+# --------------------------------------------------------------------------
+
+def resolve(rows: list[dict], roster: Roster) -> None:
+    """Annotate rows in place with member_id, confidence and method."""
+    names: dict[tuple[str, str], Optional[ParsedName]] = {}
+    for row in rows:
+        row_key = (row["raw_name"], row["is_teller"])
+        if row_key not in names:
+            names[row_key] = parse_name(
+                row["raw_name"], teller=row["is_teller"] in {"1", "True", "true"}
+            )
+        row["_name"] = names[row_key]
+        row["_date"] = date.fromisoformat(row["date"]) if row["date"] else None
+        row["_cands"] = (
+            roster.candidates(row["_name"], row["_date"]) if row["_name"] else []
         )
 
-    # -- scoring ---------------------------------------------------------
+    # Pass 1: within each division, one spell may be used once. Assign greedily
+    # by descending score so the best-evidenced entry claims a contested spell.
+    claims: list[tuple[float, str, int, str]] = []
+    for i, row in enumerate(rows):
+        for value, why, spell in row["_cands"]:
+            claims.append((value, why, i, spell.member_id))
+    claims.sort(key=lambda c: -c[0])
 
-    @staticmethod
-    def _score(name: ParsedName, m: RosterMember) -> tuple[float, str]:
-        score, why = 0.55, "surname+date"
+    used: dict[str, set[str]] = defaultdict(set)
+    for value, why, i, member_id in claims:
+        row = rows[i]
+        if row.get("member_id") or member_id in used[row["division_id"]]:
+            continue
+        cands = row["_cands"]
+        if len(cands) > 1 and cands[0][0] - cands[1][0] < AMBIGUITY_GAP:
+            continue
+        if value < THRESHOLD:
+            continue
+        row.update(member_id=member_id, match_confidence=round(value, 3),
+                   match_method=why)
+        used[row["division_id"]].add(member_id)
 
-        if name.initials and m.initials:
-            if name.initials == m.initials:
-                score, why = 0.97, "surname+full_initials"
-            elif m.initials.startswith(name.initials):
-                score, why = 0.88, "surname+initial_prefix"
-            elif name.initials[0] == m.initials[0]:
-                score, why = 0.72, "surname+first_initial"
-            else:
-                return 0.05, "initials_conflict"
-        elif name.forenames:
-            first = name.forenames.split()[0].lower()
-            mfirst = (m.forenames.split() or [""])[0].lower()
-            if first == mfirst:
-                score, why = 0.95, "surname+forename"
-            elif mfirst.startswith(first) or first.startswith(mfirst):
-                score, why = 0.80, "surname+forename_prefix"
-            else:
-                return 0.05, "forename_conflict"
+    # Pass 2: a name string resolved confidently anywhere resolves everywhere the
+    # same member was sitting, which recovers entries printed without initials.
+    learned: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        if row.get("member_id"):
+            learned[row["raw_name"]].append(row["member_id"])
+    for raw, ids in learned.items():
+        learned[raw] = [i for i in set(ids)]
 
-        if name.constituency and m.constituency:
-            if _constituency_agrees(name.constituency, m.constituency):
-                score, why = min(0.99, score + 0.15), why + "+constituency"
-            else:
-                score, why = max(0.10, score - 0.35), why + "+constituency_conflict"
-
-        return score, why
-
-    def match(
-        self, name: ParsedName, on: Optional[date] = None, threshold: float = 0.60
-    ) -> tuple[Optional[RosterMember], float, str, int]:
-        """Return (member, confidence, method, n_candidates_considered)."""
-        pool = [m for m in self._by_surname.get(name.surname_key, []) if m.serving_on(on)]
-        if not pool:
-            return None, 0.0, "no_surname_block", 0
-
-        scored = sorted(
-            ((self._score(name, m), m) for m in pool), key=lambda t: -t[0][0]
-        )
-        (best_score, best_why), best = scored[0]
-
-        # Tellers and OCR-truncated lines often carry no initials at all. If
-        # exactly one member with that surname was sitting on the date, that is
-        # strong evidence on its own - but only when nothing actively conflicts.
-        if len(pool) == 1 and best_score >= 0.50:
-            best_score, best_why = max(best_score, 0.85), best_why + "+unique_surname"
-
-        # Ambiguity penalty: if the runner-up is close, do not silently pick.
-        if len(scored) > 1:
-            runner = scored[1][0][0]
-            if best_score - runner < 0.10:
-                return None, best_score, f"ambiguous({best_why})", len(pool)
-
-        if best_score < threshold:
-            return None, best_score, f"below_threshold({best_why})", len(pool)
-        return best, best_score, best_why, len(pool)
-
-    def resolve_division(self, div: Division, threshold: float = 0.60) -> Division:
-        for v in div.votes:
-            m, conf, why, n = self.match(v.name, on=div.date, threshold=threshold)
-            v.member_id = m.member_id if m else None
-            v.match_confidence = conf
-            v.match_method = why
-            v.match_candidates = n
-        return div
+    for row in rows:
+        if row.get("member_id") or not row["_name"]:
+            continue
+        options = [
+            roster.by_id[i] for i in learned.get(row["raw_name"], [])
+            if i in roster.by_id and roster.by_id[i].covers(row["_date"])
+            and i not in used[row["division_id"]]
+        ]
+        if len(options) == 1:
+            row.update(member_id=options[0].member_id, match_confidence=0.80,
+                       match_method="propagated")
+            used[row["division_id"]].add(options[0].member_id)
 
 
-# ---------------------------------------------------------------------------
-# 6. Output
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
 
-LONG_FIELDS = [
-    "division_number", "session", "date", "time", "series", "volume",
+CARRY = [
+    "division_id", "series", "volume", "date", "division_number", "time",
     "column_start", "debate_title", "question_text", "ayes_declared",
-    "noes_declared", "ayes_counted", "noes_counted", "source_url",
-    "side", "member_id", "raw_name", "surname", "initials", "forenames",
-    "honorific", "rank", "constituency", "is_teller",
-    "match_confidence", "match_method", "match_candidates", "parse_flags",
+    "noes_declared", "ayes_extracted", "noes_extracted", "division_flags",
+    "side", "is_teller", "raw_name",
+]
+ADDED = [
+    "member_id", "surname", "initials", "forenames", "honorific", "rank",
+    "constituency", "match_confidence", "match_method", "candidates", "name_flags",
 ]
 
 
-def to_long_rows(div: Division) -> list[dict]:
-    """One row per member-division. This is the shape you want on disk."""
-    base = {
-        "division_number": div.division_number,
-        "session": div.session,
-        "date": div.date.isoformat() if div.date else "",
-        "time": div.time,
-        "series": div.series,
-        "volume": div.volume,
-        "column_start": div.column_start,
-        "debate_title": div.debate_title,
-        "question_text": div.question_text,
-        "ayes_declared": div.ayes_declared,
-        "noes_declared": div.noes_declared,
-        "ayes_counted": div.ayes_counted,
-        "noes_counted": div.noes_counted,
-        "source_url": div.source_url,
-    }
-    rows = []
-    for v in div.votes:
-        n = v.name
-        rows.append({
-            **base,
-            "side": v.side,
-            "member_id": v.member_id or "",
-            "raw_name": n.raw,
-            "surname": n.surname,
-            "initials": n.initials,
-            "forenames": n.forenames,
-            "honorific": n.honorific,
-            "rank": n.rank,
-            "constituency": n.constituency,
-            "is_teller": int(n.is_teller),
-            "match_confidence": round(v.match_confidence, 3),
-            "match_method": v.match_method,
-            "match_candidates": v.match_candidates,
-            "parse_flags": ";".join(n.parse_flags),
-        })
-    return rows
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--raw", type=Path, default=DATA_DIR / RAW_NAME)
+    ap.add_argument("--roster", type=Path, default=DATA_DIR / "member_spells.csv")
+    ap.add_argument("--out", type=Path, default=DATA_DIR / RESOLVED_NAME)
+    ap.add_argument("--review", type=Path, default=DATA_DIR / REVIEW_NAME)
+    args = ap.parse_args()
 
+    with args.raw.open(newline="", encoding="utf-8") as fh:
+        rows = [r for r in csv.DictReader(fh) if r["raw_name"]]
+    roster = Roster.from_csv(args.roster)
+    resolve(rows, roster)
 
-def write_long_csv(divisions: Sequence[Division], path: str) -> int:
-    rows = [r for d in divisions for r in to_long_rows(d)]
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=LONG_FIELDS)
-        w.writeheader()
-        w.writerows(rows)
-    return len(rows)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=CARRY + ADDED)
+        writer.writeheader()
+        for row in rows:
+            name = row["_name"]
+            writer.writerow({
+                **{k: row.get(k, "") for k in CARRY},
+                "member_id": row.get("member_id", ""),
+                "surname": name.surname if name else "",
+                "initials": name.initials if name else "",
+                "forenames": name.forenames if name else "",
+                "honorific": name.honorific if name else "",
+                "rank": name.rank if name else "",
+                "constituency": name.constituency if name else "",
+                "match_confidence": row.get("match_confidence", ""),
+                "match_method": row.get("match_method", "unmatched"),
+                "candidates": len(row["_cands"]),
+                "name_flags": ";".join(name.flags) if name else "unparsed",
+            })
 
+    with args.review.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=[
+            "division_id", "date", "side", "raw_name", "candidates",
+            "option_1", "score_1", "option_2", "score_2", "option_3", "score_3",
+        ])
+        writer.writeheader()
+        review = 0
+        for row in rows:
+            if row.get("member_id"):
+                continue
+            review += 1
+            entry = {
+                "division_id": row["division_id"], "date": row["date"],
+                "side": row["side"], "raw_name": row["raw_name"],
+                "candidates": len(row["_cands"]),
+            }
+            for n, (value, _, spell) in enumerate(row["_cands"][:3], start=1):
+                entry[f"option_{n}"] = f"{spell.member_id} {spell.surname}, {spell.forenames} ({spell.constituency})"
+                entry[f"score_{n}"] = round(value, 3)
+            writer.writerow(entry)
 
-def coverage_report(divisions: Sequence[Division]) -> dict:
-    """Run this after every batch. Match rate is your project's headline metric."""
-    votes = [v for d in divisions for v in d.votes]
-    matched = [v for v in votes if v.member_id]
-    ambiguous = [v for v in votes if v.match_method.startswith("ambiguous")]
-    unblocked = [v for v in votes if v.match_method == "no_surname_block"]
-    return {
-        "divisions": len(divisions),
-        "vote_rows": len(votes),
-        "matched": len(matched),
-        "match_rate": round(len(matched) / len(votes), 4) if votes else 0.0,
-        "ambiguous": len(ambiguous),
-        "surname_not_in_roster": len(unblocked),
-        "divisions_failing_reconciliation": sum(
-            1 for d in divisions if d.reconcile()
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
-# 7. Demo
-# ---------------------------------------------------------------------------
-
-_SAMPLE = """
-Question put, "That the Bill be now read a Second time."
-
-The House divided: Ayes, 10; Noes, 8.
-
-Division No. 43.]      AYES      [10.14 p.m.
-
-Adamson, W. M.                     Griffiths, T. (Monmouth, Pontypool)
-Alexander, Rt. Hon. A. V.          Hall, G. H. (Merthyr Tydvil)
-Attlee, Rt. Hon. C. R.             Jones, Morgan (Caerphilly)
-Cripps, Sir Stafford               McEntee, V. La T.
-
-TELLERS FOR THE AYES.—
-Mr. Charleton and Mr. Whiteley.
-
-NOES.
-
-Acland-Troyte, Lieut.-Col. G. J.   Cecil, Rt. Hon. Lord H.
-Baldwin, Rt. Hon. Stanley          de Chair, S. S.
-Bossom, A. C.                      Davies, R. J. (Westhoughton)
-
-TELLERS FOR THE NOES.—
-Captain Margesson and Sir George Penny.
-"""
-
-_ROSTER = [
-    RosterMember("R001", "Adamson", "William Murdoch", "Cannock", date(1935, 11, 14), date(1945, 6, 15)),
-    RosterMember("R002", "Alexander", "Albert Victor", "Hillsborough", date(1935, 11, 14), date(1950, 2, 23)),
-    RosterMember("R003", "Attlee", "Clement Richard", "Limehouse", date(1922, 11, 15), date(1950, 2, 23)),
-    RosterMember("R004", "Cripps", "Stafford", "Bristol East", date(1931, 1, 16), date(1950, 2, 23)),
-    RosterMember("R005", "Griffiths", "Thomas", "Pontypool", date(1918, 12, 14), date(1935, 10, 25)),
-    RosterMember("R006", "Griffiths", "Thomas", "Pontypool", date(1935, 11, 14), date(1945, 6, 15)),
-    RosterMember("R007", "Hall", "George Henry", "Merthyr Tydfil", date(1922, 11, 15), date(1946, 10, 1)),
-    RosterMember("R008", "Jones", "Morgan", "Caerphilly", date(1921, 8, 1), date(1939, 4, 23)),
-    RosterMember("R009", "Jones", "Morgan", "Denbigh", date(1930, 1, 1), date(1945, 6, 15)),
-    RosterMember("R010", "McEntee", "Valentine La Touche", "Walthamstow West", date(1929, 5, 30), date(1950, 2, 23)),
-    RosterMember("R011", "Acland-Troyte", "Gilbert John", "Tiverton", date(1924, 10, 29), date(1945, 6, 15)),
-    RosterMember("R012", "Baldwin", "Stanley", "Bewdley", date(1908, 1, 1), date(1937, 5, 28)),
-    RosterMember("R013", "Bossom", "Alfred Charles", "Maidstone", date(1931, 10, 27), date(1959, 9, 18)),
-    RosterMember("R014", "Cecil", "Hugh Richard Heathcote", "Oxford University", date(1910, 1, 1), date(1937, 2, 1)),
-    RosterMember("R015", "de Chair", "Somerset Struben", "South West Norfolk", date(1935, 11, 14), date(1945, 6, 15)),
-    RosterMember("R016", "Davies", "Rhys John", "Westhoughton", date(1921, 1, 1), date(1951, 10, 5)),
-    RosterMember("R017", "Charleton", "Henry Cecil", "Leeds South", date(1922, 11, 15), date(1945, 6, 15)),
-    RosterMember("R018", "Whiteley", "William", "Blaydon", date(1922, 11, 15), date(1955, 5, 6)),
-    RosterMember("R019", "Margesson", "Henry David Reginald", "Rugby", date(1924, 10, 29), date(1942, 1, 1)),
-    RosterMember("R020", "Penny", "George", "Kingston upon Thames", date(1922, 11, 15), date(1937, 1, 1)),
-]
-
-
-def _demo() -> None:
-    div = parse_division(
-        _SAMPLE,
-        session="1935-36",
-        date=date(1936, 3, 11),
-        volume=310,
-        column_start=1024,
-        debate_title="Tithe Bill",
-        source_url="https://api.parliament.uk/historic-hansard/commons/1936/mar/11",
-    )
-
-    print(f"Division {div.division_number}  {div.date}  {div.time}")
-    print(f"declared {div.ayes_declared}-{div.noes_declared} | "
-          f"counted {div.ayes_counted}-{div.noes_counted}")
-    print(f"question: {div.question_text}")
-    print(f"flags: {div.parse_flags or 'none'}\n")
-
-    roster = MemberRoster(_ROSTER)
-    roster.resolve_division(div)
-
-    print(f"{'side':5} {'id':6} {'conf':>5}  {'method':34} raw")
-    print("-" * 100)
-    for v in sorted(div.votes, key=lambda v: (v.side, v.name.surname_key)):
-        print(f"{v.side:5} {(v.member_id or '--'):6} {v.match_confidence:5.2f}  "
-              f"{v.match_method:34} {v.name.raw}")
-
-    print()
-    for k, val in coverage_report([div]).items():
-        print(f"  {k:34} {val}")
-
-    n = write_long_csv([div], "/mnt/user-data/outputs/divisions_long_sample.csv")
-    print(f"\nwrote {n} rows")
+    matched = sum(1 for r in rows if r.get("member_id"))
+    print(f"{len(rows)} rows, {matched} matched ({matched / len(rows):.1%}), "
+          f"{review} to review")
+    print(f"{args.out}\n{args.review}")
 
 
 if __name__ == "__main__":
-    _demo()
+    main()
