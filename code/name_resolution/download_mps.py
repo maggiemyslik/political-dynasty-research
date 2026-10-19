@@ -15,7 +15,7 @@ UA = "academic-research-scraper (LSE; maggie.myslik@lse.ac.uk)"
 MP_CLASS = "Q16707842"
 FIRST, LAST = "1909-01-01", "2004-12-31"
 BATCH = 250
-FIELDS = ["politician_id", "name", "family_names", "given_names", "aliases",
+FIELDS = ["politician_id", "name", "family_names", "given_names", "aliases", "titles",
           "constituency", "start", "end", "in_dynasty_file"]
 
 # a spell's dates come from the statement, or from its parliament when the statement has none
@@ -53,6 +53,20 @@ WHERE {
 GROUP BY ?mp ?label
 """
 
+# noble titles, so courtesy titles printed in the lists ("Dalkeith, Earl of") can be matched.
+# a title is either one item ("Earl of Home") or a generic one with an "of" qualifier
+TITLES = """
+SELECT ?mp (GROUP_CONCAT(DISTINCT ?t; separator="|") AS ?titles) WHERE {
+  VALUES ?mp { %s }
+  ?mp p:P97 ?st .
+  ?st ps:P97 ?title .
+  OPTIONAL { ?title rdfs:label ?tl FILTER(LANG(?tl) = "en") }
+  OPTIONAL { ?st pq:P642 ?of . ?of rdfs:label ?ol FILTER(LANG(?ol) = "en") }
+  BIND(IF(BOUND(?ol), CONCAT(COALESCE(?tl, ""), " of ", ?ol), ?tl) AS ?t)
+}
+GROUP BY ?mp
+"""
+
 
 def query(sparql: str) -> list[dict]:
     for wait in (10, 60, None):
@@ -88,11 +102,14 @@ if len(ids) < 1000:
     sys.exit(f"only {len(ids)} MPs returned: check that {MP_CLASS} is still the UK MP class on Wikidata")
 
 print(f"downloading names for {len(ids):,} MPs")
-names = {}
+names, titles = {}, {}
 for i in range(0, len(ids), BATCH):
     batch = " ".join(f"wd:{x}" for x in ids[i:i + BATCH])
     for b in query(NAMES % batch):
         names[qid(val(b, "mp"))] = b
+    time.sleep(1)
+    for b in query(TITLES % batch):
+        titles[qid(val(b, "mp"))] = val(b, "titles")
     time.sleep(1)
 
 dynasty = set()
@@ -112,6 +129,7 @@ with OUT.open("w", newline="", encoding="utf-8") as fh:
             "family_names": val(b, "family"),
             "given_names": val(b, "given"),
             "aliases": val(b, "aliases"),
+            "titles": titles.get(mp, ""),
             "constituency": seat,
             "start": start,
             "end": end,
@@ -122,6 +140,9 @@ print(f"\nwrote {OUT}")
 print(f"MPs: {len(ids):,}   seat spells: {len(spells):,}")
 print(f"spells with no start: {sum(1 for s in spells if not s[1]):,}   no end: {sum(1 for s in spells if not s[2]):,}"
       f"   no constituency: {sum(1 for s in spells if not s[3]):,}")
+titled = [x for x in ids if titles.get(x)]
+print(f"MPs with a noble title: {len(titled):,}   e.g. "
+      + "; ".join(f"{val(names.get(x, {}), 'label')}: {titles[x]}" for x in titled[:5]))
 print(f"MPs with no English name: {sum(1 for x in ids if not val(names.get(x, {}), 'label')):,}")
 if dynasty:
     print(f"MPs sitting 1909-2004 missing from the dynasty file: {len(set(ids) - dynasty):,}")

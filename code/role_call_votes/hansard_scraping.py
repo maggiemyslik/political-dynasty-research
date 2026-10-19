@@ -1,5 +1,6 @@
 import csv
 import io
+from bisect import bisect_right
 import re
 import sys
 import time
@@ -40,12 +41,17 @@ DIV_HEADER = re.compile(r"^\s*Divi?si?[o0]n\s+N[o0]\.?\s*(\d+)", re.I | re.M)
 TIME = re.compile(r"(\d{1,2}[.:]\d{2}\s*[ap]\.?\s*m\.?)", re.I)
 TOTALS = re.compile(
     r"(?:The\s+(?:House|Committee)\s+divided|Division\s+No).{0,80}?"
-    r"A[yv][a-z]{1,3}[,\s]+(\d+)\s*[;,]\s*N[o0][a-z]{1,3}[,\s]+(\d+)", re.I | re.S
+    r"A[yv][a-z]{1,3}[,:\s\u2014\u2013-]+(\d+)\s*[;,]\s*N[o0][a-z]{1,3}[,:\s\u2014\u2013-]+(\d+)", re.I | re.S
 )
-TOTALS_LOOSE = re.compile(r"\bA[yv][a-z]{1,3}[,\s]+(\d+)\s*[;,]\s*N[o0][a-z]{1,3}[,\s]+(\d+)", re.I)
-AYES_HEAD = re.compile(r"^\s*AYE[S5]\.?\s*(?:\[[^\n]*)?$", re.I | re.M)
-NOES_HEAD = re.compile(r"^\s*N[O0]ES\.?\s*(?:\[[^\n]*)?$", re.I | re.M)
+TOTALS_LOOSE = re.compile(
+    r"\bA[yv][a-z]{1,3}[,:\s\u2014\u2013-]+(\d+)\s*[;,]\s*N[o0][a-z]{1,3}[,:\s\u2014\u2013-]+(\d+)", re.I)
+# headings can carry leftover markup ('NOES align="center"')
+AYES_HEAD = re.compile(r"^\s*AYE[S5]\.?\s*(?:\[[^\n]*|align=[^\n]*)?$", re.I | re.M)
+NOES_HEAD = re.compile(r"^\s*N[O0]ES\.?\s*(?:\[[^\n]*|align=[^\n]*)?$", re.I | re.M)
 TELLER_HEAD = re.compile(r"TELLERS\.?\s+F[O0][RB]\s+THE\s+(?:AYE[S5]|N[O0]ES)[.:\s\u2014-]*", re.I)
+AYE_TELLERS = re.compile(r"TELLERS\.?\s+F[O0][RB]\s+THE\s+AYE[S5]", re.I)
+NO_TELLERS = re.compile(r"TELLERS\.?\s+F[O0][RB]\s+THE\s+N[O0]ES", re.I)
+SEE_COL = re.compile(r"See\s+col\.?\s*(\d+)", re.I)
 QUESTION = re.compile(
     r"Question\s+(?:again\s+)?put[^\n]{0,400}?[\"\u201c][^\"\u201d]{0,400}[\"\u201d]|"
     r"Question\s+put\.", re.I | re.S
@@ -59,7 +65,8 @@ FRAGMENT_START = re.compile(
     r"Viscount(?:ess)?|Lieut|Lt|Col|Capt|Major|Maj|Brig|Gen|Adm|Comdr|Commander|"
     r"Professor|Prof|Alderman|[A-Z]\.)", re.I
 )
-NOT_A_NAME = re.compile(r"^(?:tellers|ayes|noes|division|the\s+(?:house|committee)|question|col\b)", re.I)
+NOT_A_NAME = re.compile(r"^(?:tellers|ayes|noes|division|the\s+(?:house|committee)|question|col\b|"
+                        r"\[?interruption|bill\s+read|debate\s+adjourned)", re.I)
 LIST_ENTRY = re.compile(r"^[A-Z][A-Za-z'\-]+(?:[ -][A-Za-z'\-]+)*,\s")
 
 TITLE_MARK = "\x01T\x01"
@@ -77,22 +84,36 @@ def _line(value: Optional[str]) -> str:
     return re.sub(r"[\n\r\f\v]+", " ", value).strip()
 
 
-def flatten(root) -> str:
+def _flatten(root) -> tuple[str, list[tuple[int, date]]]:
+    """Returns (text, [(offset in text, date)]) for every ISO date attribute, in order."""
     parts: list[str] = []
+    dates: list[tuple[int, date]] = []
+    size = 0
     for el in root.iter():
+        for value in el.attrib.values():
+            if m := ISO_DATE.search(str(value)):
+                try:
+                    dates.append((size, date(int(m[1]), int(m[2]), int(m[3]))))
+                except ValueError:
+                    pass
         tag = _tag(el)
         text = _line(el.text)
         if text:
             if "title" in tag or "heading" in tag:
-                parts.append(TITLE_MARK + text)
+                text = TITLE_MARK + text
             elif tag in {"col", "colnum", "column"}:
-                parts.append(COL_MARK + text)
-            else:
-                parts.append(text)
+                text = COL_MARK + text
+            parts.append(text)
+            size += len(text) + 1
         tail = _line(el.tail)
         if tail:
             parts.append(tail)
-    return "\n".join(parts)
+            size += len(tail) + 1
+    return "\n".join(parts), dates
+
+
+def flatten(root) -> str:
+    return _flatten(root)[0]
 
 
 def sitting_date(root, filename: str) -> Optional[date]:
@@ -218,10 +239,25 @@ def _split_tellers(lines: list[str]) -> tuple[list[str], list[str], bool]:
     if not TELLER_HEAD.sub("", lines[start], count=1).strip() and start + 1 < len(lines) \
             and lines[start + 1].lstrip().startswith(("\u2014", "-", "\u2013")):
         first = start + 1  # bare heading, names start on the next line
-    i, k = first, 0
+    i, k, last = first, 0, first
     while i < len(lines):
+        # a "Surname, Forename" line is a list name, never a teller; without this, tellers
+        # printed with no closing full stop swallow the names after them
+        if i != start and LIST_ENTRY.match(lines[i]):
+            if re.search(r"\band\s*$", text, re.I) and k < 4:
+                # second teller is off the stride: take the next line that isn't a name
+                j = next((j for j in range(last + 1, min(last + 4, len(lines)))
+                          if j not in used and not LIST_ENTRY.match(lines[j])), None)
+                if j is not None:
+                    i, k = j, k + 1
+                    continue
+            if re.search(r"\band\b", text, re.I) or k >= 4:
+                break
+            i, k = (i + stride if i + stride < len(lines) else i + 1), k + 1
+            continue
         frag = TELLER_HEAD.sub("", lines[i], count=1) if i == start else lines[i]
         used.add(i)
+        last = i
         text = f"{text} {frag}".strip()
         # done once it reads "A and B." ending in a surname, not an initial ("George D.")
         if re.search(r"\band\b.*\b[A-Za-z'-]*[a-z]{2,}[A-Za-z'-]*\.$", text, re.I) or k >= 4:
@@ -229,8 +265,29 @@ def _split_tellers(lines: list[str]) -> tuple[list[str], list[str], bool]:
         # short last columns: the stride can overrun the list
         i, k = (i + stride if i + stride < len(lines) else i + 1), k + 1
     names = [l for i, l in enumerate(lines) if i not in used]
-    tellers = [t.strip(" .;:\u2014-") for t in re.split(r"\s+and\s+", text, maxsplit=1, flags=re.I)]
+    # "A and B", or in the 1970s sometimes "Mr. A. Mr. B"
+    split = r"\s+and\s+" if re.search(r"\s+and\s+", text, re.I) else r"\.\s+(?=(?:Mr|Mrs|Ms|Miss|Dr)\b)"
+    tellers = [re.sub(r"\s+and$", "", t.strip(" .;:\u2014-"), flags=re.I)
+               for t in re.split(split, text, maxsplit=1, flags=re.I)]
     return names, [t for t in tellers if re.search(r"[A-Za-z]{2}", t)], True
+
+
+def _noes_start(chunk: str) -> Optional[int]:
+    # NOES heading missing (1997 vol 294 div 1): Noes begin after the line completing the Ayes tellers
+    m = AYE_TELLERS.search(chunk)
+    if not m or not NO_TELLERS.search(chunk, m.end()):
+        return None
+    pos, seen_and = m.end(), False
+    for line in chunk[m.end():].split("\n")[:10]:
+        pos += len(line) + 1
+        line = line.strip()
+        if LIST_ENTRY.match(line):
+            continue
+        if re.search(r"\band\b", line, re.I):
+            seen_and = True
+        if seen_and and line.endswith(".") and not re.search(r"\band\s*$", line, re.I):
+            return pos
+    return None
 
 
 def _last_before(text: str, index: int, mark: str) -> str:
@@ -246,11 +303,24 @@ def divisions_in_file(xml_bytes: bytes, filename: str, series: int, volume: int
         root = ET.fromstring(xml_bytes)
     except ET.ParseError:
         return
-    text = flatten(root)
-    day = sitting_date(root, filename)
+    text, raw_dates = _flatten(root)
+    # a file holds a whole volume (several weeks of sittings), so each division takes the
+    # last date before its header. stray dates (OCR, cross-references) that break the
+    # order of sittings are dropped: 1909-04-24 between 02-22 and 02-25, or a 1906
+    dates: list[tuple[int, date]] = []
+    for n, (o, d) in enumerate(raw_dates):
+        nxt = raw_dates[n + 1][1] if n + 1 < len(raw_dates) else d
+        prev = dates[-1][1] if dates else date(1909, 1, 1)
+        if prev <= d <= date(2005, 12, 31) and (d <= nxt or nxt < prev):
+            dates.append((o, d))
+    offsets = [o for o, _ in dates]
+    divisions: list[tuple[str, list[dict], bool]] = []
+    fallback = sitting_date(root, filename)
     marks = list(DIV_HEADER.finditer(text))
 
     for i, mark in enumerate(marks):
+        j = bisect_right(offsets, mark.start())
+        day = dates[j - 1][1] if j else fallback
         stop = marks[i + 1].start() if i + 1 < len(marks) else len(text)
         chunk = text[mark.start():stop]
         if end := DIV_END.search(chunk):
@@ -269,6 +339,14 @@ def divisions_in_file(xml_bytes: bytes, filename: str, series: int, volume: int
         before_hits = list(TOTALS.finditer(before)) or list(TOTALS_LOOSE.finditer(before))
         after_hit = next(TOTALS.finditer(chunk), None)
         candidates = [(int(m[1]), int(m[2])) for m in (before_hits[-1:] + [after_hit]) if m]
+        # list printed apart from its debate ("Division List 397 [See col. 695]"): the
+        # totals are in the debate, at that column or the next
+        if see := SEE_COL.search(text[max(floor, mark.start() - 200):mark.start()]):
+            at = text.find(f"\n{COL_MARK}{see[1]}\n")
+            if at != -1:
+                nxt = text.find(COL_MARK, text.find(COL_MARK, at + 3) + 3)
+                seg = text[at:nxt if nxt != -1 else len(text)]
+                candidates += [(int(m[1]), int(m[2])) for m in TOTALS.finditer(seg)]
         # never more than 707 seats, so anything over is misread OCR ("3271")
         implausible = [c for c in candidates if max(c) > MAX_TOTAL]
         if implausible:
@@ -281,10 +359,16 @@ def divisions_in_file(xml_bytes: bytes, filename: str, series: int, volume: int
             aye_start = chunk.find("\n") + 1
         else:
             aye_start = aye_head.end() if aye_head else 0
-        if no_head and no_head.start() > aye_start:
+        no_start = no_end = None
+        if no_head:
+            no_start, no_end = no_head.start(), no_head.end()
+        elif aye_head and (p := _noes_start(chunk[aye_head.end():])) is not None:
+            no_start = no_end = aye_head.end() + p
+            flags.append("no_noes_heading")
+        if no_start is not None and no_start > aye_start:
             sides = {
-                "aye": _list_lines(chunk[aye_start:no_head.start()], is_noes=False),
-                "no": _list_lines(chunk[no_head.end():], is_noes=True),
+                "aye": _list_lines(chunk[aye_start:no_start], is_noes=False),
+                "no": _list_lines(chunk[no_end:], is_noes=True),
             }
             for side, lines in sides.items():
                 names, tellers, found = _split_tellers(lines)
@@ -340,10 +424,18 @@ def divisions_in_file(xml_bytes: bytes, filename: str, series: int, volume: int
             "division_flags": ";".join(flags),
             "source_url": f"{BASE}/{SERIES_DIR[series]}/S{series}CV{volume:04d}P0.zip",
         }
-        for side, name, teller in entries:
-            yield {**base, "side": side, "is_teller": teller, "raw_name": name}
-        if not entries:
-            yield {**base, "side": "", "is_teller": "", "raw_name": ""}
+        rows = [{**base, "side": side, "is_teller": teller, "raw_name": name}
+                for side, name, teller in entries] or [{**base, "side": "", "is_teller": "", "raw_name": ""}]
+        divisions.append((base["division_id"], rows, bool(entries)))
+
+    # a division can be headed twice, in the debate and again over its list (vol 919
+    # div 411): drop the copy without names
+    named = {did for did, _, has in divisions if has}
+    seen: set[str] = set()
+    for did, rows, has in divisions:
+        if has or (did not in named and did not in seen):
+            seen.add(did)
+            yield from rows
 
 
 def volume_zip(series: int, volume: int) -> tuple[Optional[zipfile.ZipFile], bool]:

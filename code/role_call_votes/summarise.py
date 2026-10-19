@@ -32,6 +32,18 @@ def voters(d: dict) -> int:
     return int(d["ayes_extracted"]) + int(d["noes_extracted"])
 
 
+def ranges(nums: list[int]) -> str:
+    # [1, 2, 3, 7] -> "1-3, 7"
+    out, start = [], None
+    for i, n in enumerate(nums):
+        if start is None:
+            start = n
+        if i + 1 == len(nums) or nums[i + 1] != n + 1:
+            out.append(str(start) if start == n else f"{start}-{n}")
+            start = None
+    return ", ".join(out) or "none"
+
+
 def flag_names(d: dict) -> list[str]:
     return [f.split(":")[0] for f in d["division_flags"].split(";") if f]
 
@@ -74,8 +86,8 @@ for series, last in LAST_VOLUME.items():
     blank = sorted(finished - have)
     print(f"Series {series} (volumes 1 to {last})")
     print(f"  with divisions:                      {len(have):>5}")
-    print(f"  absent from archive or 0 divisions:  {len(blank):>5}  {blank[:20]}{' ...' if len(blank) > 20 else ''}")
-    print(f"  not finished (re-run the scraper):   {len(never):>5}  {never[:20]}{' ...' if len(never) > 20 else ''}")
+    print(f"  absent from archive or 0 divisions:  {len(blank):>5}  {ranges(blank)}")
+    print(f"  not finished (re-run the scraper):   {len(never):>5}  {ranges(never)}")
 if dated:
     years = Counter(int(x[:4]) for x in dated)
     print(f"Dates: {dated[0]} to {dated[-1]}")

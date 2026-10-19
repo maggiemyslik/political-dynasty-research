@@ -1,2 +1,7 @@
-data/role_call_votes/divisions_raw.csv
 .DS_Store
+.venv/
+__pycache__/
+data/role_call_votes/
+data/name_resolution/names_resolved.csv
+final/votes_final.csv.gz
+/*.txt

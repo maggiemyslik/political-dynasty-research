@@ -94,6 +94,12 @@ for name, xml in files.items():
         print(f"    tellers: {'; '.join(tellers) or 'none found'}")
         if r["division_flags"]:
             print(f"    flags: {r['division_flags']}")
+        sides = {s: Counter(x["raw_name"] for x in group if x["side"] == s and x["is_teller"] == 0)
+                 for s in ("aye", "no")}
+        if both := sorted(set(sides["aye"]) & set(sides["no"])):
+            print(f"    on both sides: {'; '.join(both)}")
+        if repeats := sorted(n for c in sides.values() for n, k in c.items() if k > 1):
+            print(f"    repeated: {'; '.join(repeats)}")
         if r["ayes_declared"] == "":
             continue
         if max(r["ayes_declared"] - r["ayes_extracted"], r["noes_declared"] - r["noes_extracted"]) > 2:
