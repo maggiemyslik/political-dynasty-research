@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""
-mp_relatives_pipeline.py  (script 1 of 2)
-=========================================
-Offline pipeline that reproduces the first-pass coding of whether each
-post-1832 MP had a relative in Parliament, and the cousin enrichment drawn
-from the Rush database. 
 
-Creates the two files:
-
-    mp_relatives_coded.csv      one row per MP, with the coded relative fields
-    mp_relationship_edges.csv   one row per directed relationship (edge list)
-
-Steps:
-    1. Load the Stata panel.
-    2. Normalise text columns (resolve the mixed missing-value encoding).
-    3. Collapse the panel to one row per MP.
-    4. Build the Wikidata kinship graph.
-    5. Assemble the coded relative fields (has_relative, closeness, and so on).
-    6. Merge the bundled Rush cousin relationships.
-    7. Write the coded CSV, the edge list, and a summary to standard output.
-
-Usage:
-    pip install pandas numpy pyreadstat
-    python mp_relatives_pipeline.py --dta MPdata1_2_basic_bio.dta --outdir 
-    
-"""
 from __future__ import annotations
 import argparse
 import os
