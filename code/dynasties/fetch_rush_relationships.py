@@ -1,14 +1,4 @@
-#!/usr/bin/env python3
 """
-fetch_rush_relationships.py
-===========================
-Pull the FULL typed kinship graph from the Rush "Members of Parliament after
-1832" database and merge it onto the Wikidata panel (MPdata1_2_basic_bio.dta),
-keyed by rushid. 
-
-The Rush database (History of Parliament Trust, CC-BY 4.0) records member-to-
-member relationships with 18 typed labels. 
-
 member IDs ARE our `rushid`
 (verified: /members/2102 = Joseph Chamberlain).
 
@@ -23,6 +13,7 @@ with built-in CSV/JSON export
 
 we can use that for the `members` table rather than scraping 10k member pages.
 """
+
 from __future__ import annotations
 import argparse, re, sys, time
 from collections import defaultdict
