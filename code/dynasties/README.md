@@ -1,4 +1,4 @@
-# MP DYNASTIES RESEARCH
+# MP DYNASTIES
 
 ## Input file
 - `MPdata1_2_basic_bio.dta`
