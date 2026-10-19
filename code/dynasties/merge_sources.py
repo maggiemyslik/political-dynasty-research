@@ -1,25 +1,4 @@
 #!/usr/bin/env python3
-"""
-merge_sources.py
-
-Combines the two relationship edge lists already produced by the panel and Rush
-pipelines into ONE per-MP dynasty coding for the UK House of Commons (1832-present).
-
-Reads (from data/dynasties/processing/):
-  - mp_relationship_edges.csv    panel edges  (from_politician_id, to_politician_id, relation, source, ...)
-  - rush_relationship_edges.csv  Rush edges   (from_rushid, to_rushid, label)
-  - mp_relatives_coded.csv        MP universe + support columns (politician_id, politician_name, rushid, peerage_linked_flag, ...)
-
-Writes (to data/dynasties/output/):
-  - mp_relatives_coded.csv     the single deliverable, one row per MP
-  - mp_relationship_edges.csv  optional combined audit (one row per link, with source + names)
-
-Does NOT read the original Stata file. Edges from both sources are deduped at the
-(MP, relative) pair level, so a relative found by both sources is counted once.
-
-Run:  python merge_sources.py   (paths are anchored to this file)
-"""
-
 from __future__ import annotations
 import sys
 from pathlib import Path
